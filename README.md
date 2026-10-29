@@ -33,43 +33,46 @@
 
 ## 1. Visão geral
 
-Aplicação Next.js (App Router) **sem banco de dados e sem variáveis de ambiente**. Um único Route Handler (`GET /api/search`) gera candidatos de domínio a partir de um termo, consulta o servidor RDAP de cada um **em paralelo**, pontua os resultados com uma função pura e devolve JSON. A UI é um único Client Component que renderiza o resultado e guarda preferências no `localStorage`.
+Aplicação Next.js (App Router) **sem banco de dados e sem variáveis de ambiente**. Um único Route Handler (`GET /api/search`) gera candidatos de domínio a partir de um termo, consulta o servidor RDAP autoritativo de cada um (**10 por vez**, com retry e cache), pontua os resultados com uma função pura e devolve JSON ou, em *streaming*, um resultado por linha (NDJSON). A UI é um único Client Component que renderiza o resultado e guarda preferências no `localStorage`.
 
 | Item | Valor |
 |---|---|
 | Runtime | Node.js ≥ 20.9 (requisito do Next 16) |
 | Dependências de runtime | `next`, `react`, `react-dom` |
 | Fonte de verdade da disponibilidade | RDAP (RFC 7480 e RFC 9083) |
-| Estado no servidor | nenhum (stateless, sem cache, sem fila) |
+| Estado no servidor | só memória do processo: cache RDAP, bootstrap da IANA, cotação e contador de *rate limit*. Sem banco |
 | Estado no cliente | `localStorage`: `theme`, `mode`, `currency` |
-| Testes automatizados | nenhum (ver [§12](#12-melhorias-planejadas)) |
+| Testes automatizados | `node:test` sobre as funções puras (`npm test`) |
 
 ## 2. Arquitetura
 
 ```
 ┌───────────────────────────── Browser ─────────────────────────────┐
 │  app/page.tsx  ("use client")                                     │
-│   ├─ estado: q, data, cur/chosen, theme, mode, sort, filtros      │
-│   ├─ cálculo derivado: lista ordenada/filtrada, bestPrice()       │
-│   └─ fetch("/api/search?q=…")                                     │
+│   ├─ estado: q, data, progress, cur/chosen, theme, mode, sort     │
+│   ├─ lê o stream NDJSON e acumula os resultados                   │
+│   └─ deriva: lista, recommended, bestPrice()                      │
 └───────────────────────────────┬───────────────────────────────────┘
-                                │ JSON
+                                │ GET /api/search?q=…&stream=1
 ┌───────────────────────────────▼───────────────────────────────────┐
-│  app/api/search/route.ts   (Route Handler, runtime Node)          │
-│   slug(q) → candidates(kw) → Promise.all(check()) → sort → JSON   │
+│  app/api/search/route.ts                                          │
+│   slug → rateLimit(ip) → candidates → getUsdBrl()                 │
+│   pool(10) ─► checkDomain() ─► NDJSON (meta, result…, done)       │
 └───────────────────────────────┬───────────────────────────────────┘
-                                │ HTTPS (≤ 60 requisições simultâneas)
-        ┌───────────────────────┼─────────────────────────┐
-        ▼                       ▼                         ▼
- rdap.registro.br     rdap.verisign.com/{com,net}      rdap.org
-     (.com.br)               (.com, .net)         (bootstrap → registro)
+                                ▼
+ checkDomain(domain)   (lib/rdap.ts)
+   1. cache em memória?            available 2 min · taken 30 min · unknown nunca
+   2. bootstrap IANA (cache 24 h)  data.iana.org/rdap/dns.json → servidor da extensão
+   3. GET {servidor}/domain/{d}    404 available · 200 taken · 429/5xx/timeout → retry
+   4. sem RDAP ou "unknown"        DNS NS: tem servidores de nome → taken; senão unknown
 ```
 
 Decisões de projeto:
 
-- **Lógica pura em `lib/domains.ts`** (slug, pontuação, geração de candidatos, melhor preço, formatação). Só `check()` faz I/O, o que deixa o resto trivial de testar.
-- **Preço e nota são calculados no servidor; moeda e ordenação no cliente.** O servidor sempre devolve preços em USD, e a troca de moeda não exige nova requisição.
-- **Cliente sem biblioteca de UI nem de estado.** Estilos em CSS puro com custom properties.
+- **Lógica pura separada de I/O.** `lib/domains.ts` (slug, pontuação, candidatos, melhor preço, formatação) e `lib/pool.ts` não fazem rede, então são testadas direto. Rede e DNS ficam em `lib/rdap.ts` e `lib/fx.ts`.
+- **Só o servidor autoritativo diz "livre".** O `rdap.org` foi removido: ele responde `404` também quando não conhece o servidor da extensão, o que gerava falsos "livre". Agora o servidor vem do bootstrap oficial da IANA.
+- **Preço e nota no servidor; moeda e ordenação no cliente.** O servidor devolve USD e a taxa do dia; trocar de moeda não exige nova requisição.
+- **Cliente sem biblioteca de UI nem de estado.** CSS puro com custom properties.
 
 ## 3. Ciclo de vida de uma busca
 
@@ -78,18 +81,18 @@ Decisões de projeto:
         │ slug(): NFD → remove diacríticos → lowercase → [^a-z0-9]+ → "" → slice(0,40)
         ▼
  "padariadojoao"                      (< 2 caracteres → HTTP 422)
-        │ candidates()
+        │ rateLimit(ip)               (> 10 buscas/min → HTTP 429 + Retry-After)
         ▼
- 82 candidatos  →  ordena por score() desc  →  slice(0, 60)
-        │ Promise.all(check())          timeout 8 s por domínio, sem limite de concorrência
+ candidates()   82 candidatos → ordena por score() → slice(0, 60)
+        │ pool(candidatos, 10, checkDomain)       no máximo 10 consultas simultâneas
         ▼
- status ∈ { available | taken | unknown }
-        │ sort por score desc
-        ▼
- recommended = primeiro resultado com status === "available"
+ { type: "meta", query, total, rate }             NDJSON, um objeto por linha
+ { type: "result", result }  × 60                 na ordem em que cada consulta termina
+ { type: "done" }
+        │ cliente: recommended = melhor nota entre os "available" (só ao terminar)
 ```
 
-**Geração de candidatos.** São 15 *bases*: o termo, 6 prefixos (`get`, `my`, `try`, `use`, `go`, `the`) e 8 sufixos (`app`, `hub`, `lab`, `hq`, `now`, `online`, `br`, `pro`). A base exata é combinada com as **12 extensões**, e as demais só com as **5 principais** (`com`, `com.br`, `io`, `app`, `dev`): 12 + 14 × 5 = **82 candidatos**. Eles são ordenados por nota e cortados em `MAX_CHECKS = 60`, limitando o fan-out por busca.
+**Geração de candidatos.** São 15 *bases*: o termo, 6 prefixos (`get`, `my`, `try`, `use`, `go`, `the`) e 8 sufixos (`app`, `hub`, `lab`, `hq`, `now`, `online`, `br`, `pro`). A base exata é combinada com as **12 extensões**, e as demais só com as **5 principais** (`com`, `com.br`, `io`, `app`, `dev`): 12 + 14 × 5 = **82 candidatos**. Eles são ordenados por nota e cortados em `MAX_CHECKS = 60`.
 
 ## 4. Algoritmos
 
@@ -117,23 +120,23 @@ Exemplo: `padariadojoao.com` → 40 + (30 − 2·8 = 14) + 20 = **74**; `padaria
 
 Os preços são **constantes de estimativa** em `TLDS`, não cotações de mercado.
 
-### 4.2 Disponibilidade (`check`)
+### 4.2 Disponibilidade (`checkDomain`)
 
-```ts
-fetch(rdapUrl(domain, tld), {
-  headers: { Accept: "application/rdap+json" },
-  signal: AbortSignal.timeout(8000),
-  cache: "no-store",
-});
-```
+O servidor RDAP vem do **bootstrap da IANA** (RFC 9224), indexado pelo último rótulo do domínio (`com.br` → `br`). O arquivo é baixado uma vez e fica em cache por 24 h; se o download falhar, usa-se o último válido ou, na falta dele, um mapa mínimo (`com`, `net`, `br`).
 
-| Resposta | Status interno |
+| Resposta do servidor | Status |
 |---|---|
 | HTTP `404` | `available` |
 | HTTP `200` | `taken` |
-| Qualquer outro código, timeout ou erro de rede | `unknown` |
+| `429`, `5xx`, timeout ou erro de rede | repete até 2 vezes e, se persistir, `unknown` |
+| Outros códigos (`400`, `403`…) | `unknown` |
 
-Roteamento do endpoint: `.com.br` → `rdap.registro.br`; `.com` e `.net` → `rdap.verisign.com/{tld}/v1/`; demais → `rdap.org` (redireciona ao RDAP do registro; o `fetch` segue os redirects). `unknown` **nunca** é recomendado. Veja a ressalva sobre falsos positivos em [§11](#11-limitações-conhecidas).
+- **Timeout** de 4 s por tentativa. **Backoff** exponencial com *jitter* (300 ms, 600 ms…), respeitando `Retry-After` (limitado a 3 s).
+- **Sem RDAP.** Extensões ausentes do bootstrap (no momento do teste, `.io` e `.co`) nunca viram `available`. O código consulta o DNS: se existem registros **NS**, o domínio é `taken`; senão fica `unknown`.
+- O mesmo DNS é usado como apoio quando o RDAP devolve `unknown`.
+- **Cache** em memória: `available` por 2 min, `taken` por 30 min, `unknown` nunca. Limite de 5000 entradas, removendo as mais antigas.
+
+`unknown` **nunca** é recomendado.
 
 ### 4.3 Recomendação e melhor preço
 
@@ -142,7 +145,7 @@ Roteamento do endpoint: `.com.br` → `rdap.registro.br`; `.com` e `.net` → `r
 
 ### 4.4 Moeda
 
-Preços trafegam em USD. O cliente aplica `USD_BRL = 5.5` (constante) e formata com `Intl.NumberFormat` (`pt-BR`/BRL ou `en-US`/USD, sem casas decimais). Precedência da moeda ativa:
+Preços trafegam em USD. O servidor busca a cotação em `lib/fx.ts` (AwesomeAPI e, como alternativa, `open.er-api.com`), com *timeout* de 3 s, faixa de sanidade 2 < taxa < 12 e cache de 1 h. Se as duas falharem, usa a última cotação boa ou a constante `USD_BRL = 5.5`, e tenta de novo em 5 min. O cliente formata com `Intl.NumberFormat` (`pt-BR`/BRL ou `en-US`/USD, sem casas decimais). Precedência da moeda ativa:
 
 ```
 cur = chosen ?? suggested
@@ -154,14 +157,15 @@ suggested = (q.length ≥ 2 ? isPortuguese(q) || navigator.language ∈ pt* : na
 ## 5. Contrato da API
 
 ```
-GET /api/search?q=<texto>
+GET /api/search?q=<texto>[&stream=1]
 ```
 
-**200**
+### Resposta JSON (padrão)
 
 ```jsonc
 {
   "query": "padariadojoao",            // termo normalizado
+  "rate": 5.39,                         // USD→BRL usado nesta resposta
   "recommended": {                      // null se não houver domínio livre
     "domain": "padariadojoao.com",
     "status": "available",
@@ -173,14 +177,30 @@ GET /api/search?q=<texto>
 }
 ```
 
-**422** `{ "error": "Digite ao menos 2 letras ou números." }` quando o termo normalizado tem menos de 2 caracteres.
+### Streaming (`stream=1`, `application/x-ndjson`)
+
+```
+{"type":"meta","query":"padariadojoao","total":60,"rate":5.39}
+{"type":"result","result":{"domain":"padariadojoao.com.br","status":"available","score":70,"price":8,"exact":true}}
+… (um por candidato, na ordem de conclusão)
+{"type":"done"}
+```
+
+Se o cliente desconecta, as consultas que ainda não começaram são descartadas.
+
+### Erros
+
+| HTTP | Quando | Corpo |
+|---|---|---|
+| `422` | termo normalizado com menos de 2 caracteres | `{ "error": "Digite ao menos 2 letras ou números." }` |
+| `429` | mais de 10 buscas por minuto do mesmo IP | `{ "error": "Muitas buscas seguidas. Tente de novo em Ns." }` + `Retry-After` |
+
+O IP vem de `x-forwarded-for` (primeiro valor) ou `x-real-ip`.
 
 ```ts
 type Status = "available" | "taken" | "unknown";
 interface Result { domain: string; status: Status; score: number; price: number; exact: boolean }
 ```
-
-A rota não define limites de taxa, `Cache-Control` nem `maxDuration`: o tempo total é limitado pelo pior timeout individual (≈ 8 s) mais o custo de redirects.
 
 ## 6. Cliente: estado e persistência
 
@@ -214,25 +234,34 @@ O listener de `scroll` é `passive` e só chama `setScrolled`, que re-renderiza 
 
 ```
 app/
-  api/search/route.ts   Route Handler: orquestra a busca
+  api/search/route.ts   Route Handler: valida, limita, orquestra e faz streaming
   layout.tsx            <html>, metadados, script anti-flash
-  page.tsx              Client Component: UI, estado, preferências
+  page.tsx              Client Component: UI, estado, leitura do stream, preferências
   globals.css           tokens, componentes, temas, modo escuro
 lib/
-  domains.ts            TLDS, slug, score, candidates, check, isPortuguese,
+  domains.ts            (puro) TLDS, slug, score, candidates, isPortuguese,
                         formatPrice, bestPrice, USD_BRL
+  rdap.ts               bootstrap IANA, consulta RDAP com retry, DNS, cache
+  pool.ts               (puro) execução com limite de concorrência
+  ratelimit.ts          janela fixa por IP
+  fx.ts                 cotação USD→BRL ao vivo com reserva
   registrars.ts         REGISTRARS: dados do ranking (ordem = posição)
+tests/
+  domains.test.ts       node:test: slug, score, candidates, bestPrice, isPortuguese,
+                        formatPrice, pickService, pool
 ```
 
 ### Pontos de extensão
 
 | Tarefa | Local |
 |---|---|
-| Nova extensão (peso e preço) | `TLDS` em `lib/domains.ts`; se precisar de servidor RDAP próprio, `rdapUrl()` |
+| Nova extensão (peso e preço) | `TLDS` em `lib/domains.ts` (o servidor RDAP vem do bootstrap da IANA) |
 | Prefixos/sufixos | `PREFIXES`, `SUFFIXES` |
-| Limite de consultas por busca | `MAX_CHECKS` |
+| Limite de consultas por busca / simultâneas | `MAX_CHECKS` (`lib/domains.ts`) / `CONCURRENCY` (`route.ts`) |
+| Limite de buscas por IP | `MAX_PER_WINDOW`, `WINDOW_MS` em `lib/ratelimit.ts` |
+| TTLs, timeout e retries do RDAP | `TTL`, `TIMEOUT_MS`, `RETRIES` em `lib/rdap.ts` |
 | Corte de qualidade do melhor preço | `bestPrice()` (hoje `score >= 50`) |
-| Cotação | `USD_BRL` |
+| Cotação de reserva / fontes de câmbio | `USD_BRL` em `lib/domains.ts` / `lib/fx.ts` |
 | Registrador no ranking | novo objeto em `lib/registrars.ts` |
 | Novo tema | bloco `[data-theme="x"]` em `globals.css` + item em `THEMES` (`page.tsx`) |
 
@@ -243,6 +272,7 @@ npm install
 npm run dev        # http://localhost:3000 (Turbopack/HMR)
 npm run build      # build de produção + checagem de tipos
 npm start          # servidor de produção
+npm test           # testes unitários (node:test; Node ≥ 22.18 roda .ts direto)
 npx tsc --noEmit   # só checagem de tipos
 ```
 
@@ -251,5 +281,15 @@ Teste manual rápido da API:
 ```bash
 curl -s "http://localhost:3000/api/search?q=padaria%20do%20joao" | jq '.recommended'
 curl -si "http://localhost:3000/api/search?q=a"                  # 422
+curl -sN "http://localhost:3000/api/search?q=padaria&stream=1"   # NDJSON
 ```
+
+## 10. Deploy e operação
+
+Qualquer host de Node.js serve (`npm run build && npm start`); não há variáveis de ambiente nem migrações.
+
+- **Egress.** O servidor precisa alcançar `data.iana.org`, os servidores RDAP (`rdap.registro.br`, `rdap.verisign.com` etc.), o DNS e as APIs de câmbio.
+- **Fan-out controlado.** No máximo 10 consultas simultâneas por busca e 10 buscas por minuto por IP, o que limita a ~600 consultas por minuto por IP. Os `429` dos registros são tratados com *backoff*.
+- **Estado em memória.** Cache, bootstrap, cotação e contador de *rate limit* vivem no processo. Em *serverless* ou com várias instâncias, cada uma tem o seu (ver §11).
+- **Atrás de proxy.** O *rate limit* confia em `x-forwarded-for`. Só é seguro se o proxy sobrescreve esse cabeçalho; caso contrário o cliente pode forjá-lo.
 

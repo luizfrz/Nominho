@@ -50,31 +50,10 @@ export function candidates(kw: string) {
     .slice(0, MAX_CHECKS);
 }
 
-function rdapUrl(domain: string, tld: string): string {
-  if (tld === "com.br") return `https://rdap.registro.br/domain/${domain}`;
-  if (tld === "com" || tld === "net") return `https://rdap.verisign.com/${tld}/v1/domain/${domain}`;
-  return `https://rdap.org/domain/${domain}`;
-}
-
-export async function check(domain: string, tld: string): Promise<Status> {
-  try {
-    const res = await fetch(rdapUrl(domain, tld), {
-      headers: { Accept: "application/rdap+json" },
-      signal: AbortSignal.timeout(8000),
-      cache: "no-store",
-    });
-    if (res.status === 404) return "available";
-    if (res.status === 200) return "taken";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 // ---------- idioma, moeda e melhor preço ----------
 export type Currency = "BRL" | "USD";
 
-/** Cotação fixa e aproximada, só para estimativa. */
+/** Cotação de reserva, usada quando a cotação ao vivo (lib/fx.ts) não está disponível. */
 export const USD_BRL = 5.5;
 
 const PT_WORDS = new Set([
@@ -97,9 +76,9 @@ export function isPortuguese(text: string): boolean {
   return words.some((w) => w.length >= 5 && /(cao|coes|inho|inha|aria|eiro|eira|dade|mente)$/.test(w));
 }
 
-export function formatPrice(usd: number, cur: Currency): string {
+export function formatPrice(usd: number, cur: Currency, rate: number = USD_BRL): string {
   return cur === "BRL"
-    ? new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", maximumFractionDigits: 0 }).format(usd * USD_BRL)
+    ? new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", maximumFractionDigits: 0 }).format(usd * rate)
     : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(usd);
 }
 

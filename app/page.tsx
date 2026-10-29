@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useState, type FormEvent, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { REGISTRARS } from "@/lib/registrars";
-import { bestPrice, formatPrice, isPortuguese, type Currency, type Result } from "@/lib/domains";
+import { USD_BRL, bestPrice, formatPrice, isPortuguese, type Currency, type Result } from "@/lib/domains";
 
 interface Data {
   query: string;
-  recommended: Result | null;
+  rate: number;
   results: Result[];
 }
 
@@ -107,6 +107,8 @@ export default function Home() {
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const abortRef = useRef<AbortController | null>(null);
   const [chosen, setChosen] = useState<Currency | null>(null);
   const [browserPt, setBrowserPt] = useState(false);
   const [showAllRank, setShowAllRank] = useState(false);
@@ -178,20 +180,49 @@ export default function Home() {
     } catch {}
   }
 
+  /** Lê a resposta em NDJSON e mostra cada domínio assim que a consulta termina. */
   async function search(term: string) {
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     setLoading(true);
     setError("");
+    setData(null);
+    setProgress({ done: 0, total: 0 });
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(term)}`);
-      const json = await res.json();
-      if (json.error) {
-        setError(json.error);
-        setData(null);
-      } else setData(json);
-    } catch {
-      setError("Não foi possível consultar agora. Tente novamente.");
+      const res = await fetch(`/api/search?q=${encodeURIComponent(term)}&stream=1`, { signal: ctrl.signal });
+      if (!res.ok || !res.body) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error ?? "Não foi possível consultar agora. Tente novamente.");
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const m = JSON.parse(line);
+          if (m.type === "meta") {
+            setProgress({ done: 0, total: m.total });
+            setData({ query: m.query, rate: m.rate, results: [] });
+          } else if (m.type === "result") {
+            setProgress((p) => ({ ...p, done: p.done + 1 }));
+            setData((d) => (d ? { ...d, results: [...d.results, m.result as Result] } : d));
+          }
+        }
+      }
+    } catch (e) {
+      if (ctrl.signal.aborted) return; // uma busca mais nova assumiu
+      setError(e instanceof Error ? e.message : "Não foi possível consultar agora. Tente novamente.");
+      setData(null);
     }
-    setLoading(false);
+    if (abortRef.current === ctrl) setLoading(false);
   }
 
   function submit(e: FormEvent) {
@@ -210,8 +241,10 @@ export default function Home() {
   const list = (data?.results.filter((r) => !onlyFree || r.status === "available") ?? []).sort((a, b) =>
     sort === "price" ? a.price - b.price || b.score - a.score : b.score - a.score,
   );
-  const best = data ? bestPrice(data.results) : null;
-  const rec = data?.recommended;
+  const rate = data?.rate ?? USD_BRL;
+  // recomendação e melhor preço só fazem sentido com todos os resultados na mão
+  const best = data && !loading ? bestPrice(data.results) : null;
+  const rec = data && !loading ? ([...data.results].sort((a, b) => b.score - a.score).find((r) => r.status === "available") ?? null) : null;
 
   return (
     <>
@@ -331,13 +364,19 @@ export default function Home() {
       <main>
         {error && <div className="error">⚠ {error}</div>}
 
-        {loading && (
+        {loading && !data?.results.length && (
           <div className="skels">
             <div className="skel big" />
             <div className="skel" />
             <div className="skel" />
             <div className="skel" />
           </div>
+        )}
+
+        {loading && data && data.results.length > 0 && (
+          <p className="note" style={{ marginTop: 40 }}>
+            Verificando nos registros oficiais… {progress.done} de {progress.total}
+          </p>
         )}
 
         {!data && !loading && !error && (
@@ -370,9 +409,9 @@ export default function Home() {
           </section>
         )}
 
-        {data && !loading && (
+        {data && data.results.length > 0 && (
           <>
-            {rec ? (
+            {!loading && (rec ? (
               <section className="ticket">
                 <div className="t-main">
                   <span className="t-label">★ Recomendado</span>
@@ -382,7 +421,7 @@ export default function Home() {
                   </div>
                   <p className="t-why">{reason(rec)}</p>
                   <div className="facts">
-                    <span className="fact">~{formatPrice(rec.price, cur)}/ano</span>
+                    <span className="fact">~{formatPrice(rec.price, cur, rate)}/ano</span>
                     <span className="fact">{rec.domain.indexOf(".")} caracteres</span>
                     {rec.exact && <span className="fact">nome exato</span>}
                   </div>
@@ -403,7 +442,7 @@ export default function Home() {
               </section>
             ) : (
               <div className="empty">Nada livre para essa ideia. Tente outra palavra, mais específica.</div>
-            )}
+            ))}
 
             {best && (
               <aside className="deal">
@@ -412,7 +451,7 @@ export default function Home() {
                 <p>
                   {rec && best.domain === rec.domain
                     ? "Sua recomendação também é a opção mais barata. Aproveite!"
-                    : `Por ${formatPrice(best.price, cur)}/ano${rec ? `, ${formatPrice(Math.max(0, rec.price - best.price), cur)} a menos que a recomendada` : ""}.`}
+                    : `Por ${formatPrice(best.price, cur, rate)}/ano${rec ? `, ${formatPrice(Math.max(0, rec.price - best.price), cur, rate)} a menos que a recomendada` : ""}.`}
                 </p>
                 <a className="reg" target="_blank" rel="noopener noreferrer" href={buyUrl(best.domain)}>REGISTRAR</a>
               </aside>
@@ -454,7 +493,7 @@ export default function Home() {
                       <span className="i">{String(i + 1).padStart(2, "0")}</span>
                       <span className="d"><Name domain={r.domain} />{best?.domain === r.domain && <span className="best">melhor preço</span>}</span>
                       <Meter value={r.score} />
-                      <span className="price">{formatPrice(r.price, cur)}/ano</span>
+                      <span className="price">{formatPrice(r.price, cur, rate)}/ano</span>
                       <span className={`stamp ${r.status}`}>{LABEL[r.status]}</span>
                       {r.status === "available" ? (
                         <a className="reg" target="_blank" rel="noopener noreferrer" href={buyUrl(r.domain)}>REGISTRAR</a>
@@ -466,7 +505,7 @@ export default function Home() {
                 </ul>
               </>
             )}
-            <footer>* “Sem resposta” = o registro não respondeu a tempo. Preços são estimativas anuais{cur === "BRL" ? " (US$ 1 ≈ R$ 5,50)" : ""}; confirme o valor final no site de registro. A regra do melhor preço escolhe o mais barato entre os livres com nota 50 ou mais.</footer>
+            <footer>* “Sem resposta” = o registro não respondeu a tempo. Preços são estimativas anuais{cur === "BRL" ? ` (US$ 1 ≈ R$ ${rate.toFixed(2).replace(".", ",")})` : ""}; confirme o valor final no site de registro. A regra do melhor preço escolhe o mais barato entre os livres com nota 50 ou mais.</footer>
           </>
         )}
 
