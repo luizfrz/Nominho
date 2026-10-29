@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔎 Nominho
+# Nominho
 
 **Busca de domínios com verificação de disponibilidade via RDAP, ranqueamento determinístico e recomendação de registrador.**
 
