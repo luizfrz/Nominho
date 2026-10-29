@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, type FormEvent, type MouseEvent } from "react";
+import { REGISTRARS } from "@/lib/registrars";
 import { bestPrice, formatPrice, isPortuguese, type Currency, type Result } from "@/lib/domains";
 
 interface Data {
@@ -77,7 +78,7 @@ function wave(e: MouseEvent<HTMLElement>) {
     const dy = clientY - (r.top + r.height / 2);
     const p = Math.max(0, 1 - Math.hypot(dx, dy) / 150);
     el.style.transform = p ? `translateY(${-p * 24}px) scale(${1 + p * 0.4}) rotate(${(-dx / 14) * p}deg)` : "";
-    el.style.color = p > 0.3 ? (el.closest("i") ? "var(--paper)" : "var(--lime)") : "";
+    el.style.color = p > 0.3 ? (el.closest("i") ? "#f4f1e8" : "var(--lime)") : "";
   });
 }
 
@@ -106,12 +107,46 @@ export default function Home() {
   const [data, setData] = useState<Data | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [cur, setCur] = useState<Currency>("USD");
+  const [chosen, setChosen] = useState<Currency | null>(null);
   const [browserPt, setBrowserPt] = useState(false);
+  const [showAllRank, setShowAllRank] = useState(false);
   const [theme, setTheme] = useState("azul");
+  const [mode, setMode] = useState<"auto" | "light" | "dark">("auto");
+  const [modeReady, setModeReady] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
   const [sort, setSort] = useState<"score" | "price">("score");
 
   useEffect(() => setTheme(document.documentElement.dataset.theme || "azul"), []);
+
+  // modo escuro: "auto" escurece ao descer a página; "escuro" e "claro" fixam
+  useEffect(() => {
+    try {
+      const m = localStorage.getItem("mode");
+      if (m === "auto" || m === "light" || m === "dark") setMode(m);
+    } catch {}
+    setModeReady(true);
+  }, []);
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 280);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const dark = mode === "dark" || (mode === "auto" && scrolled);
+
+  useEffect(() => {
+    if (modeReady) document.documentElement.dataset.dark = dark ? "1" : "0";
+  }, [dark, modeReady]);
+
+  function cycleMode() {
+    const next = mode === "auto" ? "dark" : mode === "dark" ? "light" : "auto";
+    setMode(next);
+    try {
+      localStorage.setItem("mode", next);
+    } catch {}
+  }
 
   function pickTheme(id: string) {
     setTheme(id);
@@ -126,9 +161,24 @@ export default function Home() {
   // texto em português → R$; sem pistas no texto, vale o idioma do navegador
   const typedPt = isPortuguese(q);
   const liveCur: Currency = q.trim().length < 2 ? (browserPt ? "BRL" : "USD") : typedPt || browserPt ? "BRL" : "USD";
+  // regra: a escolha da pessoa vale mais; sem escolha, usamos a sugestão pelo idioma
+  const cur: Currency = chosen ?? liveCur;
+
+  useEffect(() => {
+    try {
+      const c = localStorage.getItem("currency");
+      if (c === "BRL" || c === "USD") setChosen(c);
+    } catch {}
+  }, []);
+
+  function pickCurrency(c: Currency) {
+    setChosen(c);
+    try {
+      localStorage.setItem("currency", c);
+    } catch {}
+  }
 
   async function search(term: string) {
-    setCur(isPortuguese(term) || browserPt ? "BRL" : "USD");
     setLoading(true);
     setError("");
     try {
@@ -179,10 +229,13 @@ export default function Home() {
       <section className="hero">
         <nav className="nav">
           <span className="logo hov">
-            <Letters text="domínio" />
+            <Letters text="nominho" />
             <i>.</i>
           </span>
           <div className="nav-r">
+            <button type="button" className="modebtn" onClick={cycleMode} title="Alternar modo: automático, escuro, claro">
+              {mode === "auto" ? "🌓 Auto" : mode === "dark" ? "🌙 Escuro" : "☀️ Claro"}
+            </button>
             <div className="themes" role="group" aria-label="Tema de cor">
               {THEMES.map((t) => (
                 <button
@@ -222,7 +275,7 @@ export default function Home() {
             <div className="addr">
               <div className="addr-top">
                 <i /><i /><i />
-                <small>{liveCur === "BRL" ? (typedPt ? "🇧🇷 português detectado · preços em R$" : "🇧🇷 preços em R$") : "🌎 preços em US$"}</small>
+                <small>{cur === "BRL" ? "🇧🇷 preços em reais (R$)" : "🌎 preços em dólar (US$)"}</small>
               </div>
               <form className="addr-row" onSubmit={submit}>
                 <span className="proto">https://</span>
@@ -241,6 +294,19 @@ export default function Home() {
                 </button>
               </form>
             </div>
+          </div>
+
+          <div className="pay">
+            <span>Como você quer pagar?</span>
+            <div className="toggle" role="group" aria-label="Moeda">
+              <button type="button" className={cur === "BRL" ? "on" : ""} onClick={() => pickCurrency("BRL")}>R$ REAIS</button>
+              <button type="button" className={cur === "USD" ? "on" : ""} onClick={() => pickCurrency("USD")}>US$ DÓLAR</button>
+            </div>
+            {!chosen && (
+              <span className="hint">
+                {typedPt ? "Detectamos português no que você digitou." : browserPt ? "Sugerido pelo idioma do navegador." : "Escolha a moeda."}
+              </span>
+            )}
           </div>
 
           <div className="chips">
@@ -403,6 +469,40 @@ export default function Home() {
             <footer>* “Sem resposta” = o registro não respondeu a tempo. Preços são estimativas anuais{cur === "BRL" ? " (US$ 1 ≈ R$ 5,50)" : ""}; confirme o valor final no site de registro. A regra do melhor preço escolhe o mais barato entre os livres com nota 50 ou mais.</footer>
           </>
         )}
+
+        <section className="rank" id="ranking">
+          <h2 className="sec-title">
+            <span>Ranking · onde registrar</span>
+            <span>nossa avaliação</span>
+          </h2>
+          <p className="rank-sub">Achou o domínio? Estes são os sites que mais indicamos para registrar, do melhor ao mais comum.</p>
+          <ol className="rank-list">
+            {(showAllRank ? REGISTRARS : REGISTRARS.slice(0, 6)).map((r, i) => (
+              <li key={r.name} className={i === 0 ? "rk top" : "rk"}>
+                <span className="pos">{i + 1}</span>
+                <div className="rk-body">
+                  <div className="rk-head">
+                    <b>{r.name}</b>
+                    <span className="rk-tag">{r.bestFor}</span>
+                  </div>
+                  <ul className="rk-pc">
+                    {r.pros.map((t) => (
+                      <li key={t} className="pro">{t}</li>
+                    ))}
+                    {r.cons.map((t) => (
+                      <li key={t} className="con">{t}</li>
+                    ))}
+                  </ul>
+                </div>
+                <a className="reg" target="_blank" rel="noopener noreferrer" href={r.url}>VISITAR →</a>
+              </li>
+            ))}
+          </ol>
+          <button type="button" className="btn more" onClick={() => setShowAllRank((v) => !v)}>
+            {showAllRank ? "VER MENOS ↑" : `VER TODOS OS ${REGISTRARS.length} SITES ↓`}
+          </button>
+          <p className="rank-note">* Ranking de opinião, pensado para quem está no Brasil. Preços e condições mudam: confira no site antes de comprar.</p>
+        </section>
       </main>
     </>
   );
