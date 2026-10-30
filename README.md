@@ -1,6 +1,9 @@
 <div align="center">
 
 # Nominho
+<img width="300" height="300" alt="4 Sem Título_20261030102922" src="https://github.com/user-attachments/assets/5434d2f3-a3d2-487a-9f8a-57840a60475c" />
+
+
 
 **Busca de domínios com verificação de disponibilidade via RDAP, ranqueamento determinístico e recomendação de registrador.**
 
