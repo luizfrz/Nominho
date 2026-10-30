@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { REGISTRARS } from "@/lib/registrars";
+import { searchDomains } from "@/lib/search";
 import { USD_BRL, bestPrice, formatPrice, isPortuguese, type Currency, type Result } from "@/lib/domains";
 
 interface Data {
@@ -190,33 +191,16 @@ export default function Home() {
     setData(null);
     setProgress({ done: 0, total: 0 });
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(term)}&stream=1`, { signal: ctrl.signal });
-      if (!res.ok || !res.body) {
-        const j = await res.json().catch(() => ({}));
-        throw new Error(j.error ?? "Não foi possível consultar agora. Tente novamente.");
-      }
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-          const m = JSON.parse(line);
-          if (m.type === "meta") {
-            setProgress({ done: 0, total: m.total });
-            setData({ query: m.query, rate: m.rate, results: [] });
-          } else if (m.type === "result") {
-            setProgress((p) => ({ ...p, done: p.done + 1 }));
-            setData((d) => (d ? { ...d, results: [...d.results, m.result as Result] } : d));
-          }
-        }
-      }
+      await searchDomains(term, ctrl.signal, {
+        onMeta: (m) => {
+          setProgress({ done: 0, total: m.total });
+          setData({ query: m.query, rate: m.rate, results: [] });
+        },
+        onResult: (r) => {
+          setProgress((p) => ({ ...p, done: p.done + 1 }));
+          setData((d) => (d ? { ...d, results: [...d.results, r] } : d));
+        },
+      });
     } catch (e) {
       if (ctrl.signal.aborted) return; // uma busca mais nova assumiu
       setError(e instanceof Error ? e.message : "Não foi possível consultar agora. Tente novamente.");

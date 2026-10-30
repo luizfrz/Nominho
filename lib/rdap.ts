@@ -1,4 +1,3 @@
-import { Resolver } from "node:dns/promises";
 import type { Status } from "./domains";
 
 const BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json";
@@ -25,7 +24,7 @@ interface State {
   bootstrapPromise?: Promise<Bootstrap | null>;
   cache: Map<string, { status: Status; exp: number }>;
 }
-// sobrevive ao hot reload do Next em desenvolvimento
+// sobrevive ao hot reload do Next em desenvolvimento (e vive no navegador)
 const g = globalThis as unknown as { __nominho_rdap?: State };
 const state: State = (g.__nominho_rdap ??= { cache: new Map() });
 
@@ -97,12 +96,16 @@ async function rdapStatus(base: string, domain: string): Promise<Status> {
   return "unknown";
 }
 
-const resolver = new Resolver({ timeout: 2000, tries: 1 });
-
-/** Apoio quando não há RDAP: se existem servidores de nome, o domínio certamente está registrado. */
+/** Apoio quando não há RDAP: se existem servidores de nome (DNS sobre HTTPS), o domínio certamente está registrado. */
 async function hasNameservers(domain: string): Promise<boolean> {
   try {
-    return (await resolver.resolveNs(domain)).length > 0;
+    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=NS`, {
+      headers: { Accept: "application/dns-json" },
+      signal: AbortSignal.timeout(2000),
+      cache: "no-store",
+    });
+    const j = (await res.json()) as { Status?: number; Answer?: { type: number }[] };
+    return j.Status === 0 && !!j.Answer?.some((a) => a.type === 2);
   } catch {
     return false;
   }
